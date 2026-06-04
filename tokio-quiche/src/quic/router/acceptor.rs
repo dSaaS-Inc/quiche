@@ -167,18 +167,8 @@ where
 
             #[cfg(target_os = "linux")]
             {
-                let from = Some(incoming.local_addr).filter(|_| with_pktinfo);
-                let _ = crate::quic::io::gso::send_to(
-                    udp,
-                    to,
-                    from,
-                    send_buf,
-                    send_buf.len(),
-                    None,
-                    would_block_metric,
-                    send_to_wouldblock_duration_s,
-                )
-                .await;
+                let _ = (with_pktinfo, would_block_metric, send_to_wouldblock_duration_s);
+                let _ = socket.send_to(send_buf, to).await;
             }
 
             #[cfg(not(target_os = "linux"))]

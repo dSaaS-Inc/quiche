@@ -87,6 +87,14 @@ impl Config {
             ..
         } = socket_capabilities;
 
+        let has_gso = has_gso
+            && !matches!(
+                std::env::var("TOKIO_QUICHE_DISABLE_GSO")
+                    .as_deref()
+                    .map(str::trim),
+                Ok("1") | Ok("true") | Ok("TRUE") | Ok("True")
+            );
+
         #[cfg(feature = "gcongestion")]
         let pacing_offload = quic_settings.enable_pacing && pacing_offload;
 

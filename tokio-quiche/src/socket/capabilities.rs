@@ -389,7 +389,15 @@ impl SocketCapabilities {
         S: AsFd,
     {
         let mut b = SocketCapabilitiesBuilder::new(socket);
-        let _ = b.gso();
+        let disable_gso = matches!(
+            std::env::var("TOKIO_QUICHE_DISABLE_GSO")
+                .as_deref()
+                .map(str::trim),
+            Ok("1") | Ok("true") | Ok("TRUE") | Ok("True")
+        );
+        if !disable_gso {
+            let _ = b.gso();
+        }
         let _ = b.check_udp_drop();
         let _ = b.txtime();
         #[cfg(feature = "perf-quic-listener-metrics")]
