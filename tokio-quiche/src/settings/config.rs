@@ -190,6 +190,9 @@ fn make_quiche_config(
 
     if quic_settings.verify_peer {
         config.verify_peer(quic_settings.verify_peer);
+        if let Some(file) = quic_settings.verify_locations_file.as_deref() {
+            config.load_verify_locations_from_file(file)?;
+        }
     }
 
     config.set_max_connection_window(quic_settings.max_connection_window);
