@@ -115,9 +115,9 @@ impl From<H3Event> for ServerH3Event {
             H3Event::IncomingHeaders(incoming_headers) => {
                 // Server `incoming_headers` are exclusively created in
                 // `ServerHooks::handle_request`, which correctly serializes the
-                // RawPriorityValue and IsInEarlyData values.
+                // `RawPriorityValue` and `IsInEarlyData` values.
                 //
-                // See `H3Driver::process_read_event` for implementation details.
+                // `H3Driver::process_read_event` implements this behavior.
                 Self::Headers {
                     incoming_headers,
                     priority: None,
@@ -164,6 +164,9 @@ pub struct ServerHooks {
     /// Handle to the post-accept timeout entry. If present, the server must
     /// receive a HEADERS frame before this timeout.
     post_accept_timeout: Option<TimeoutKey>,
+    /// Whether the extended CONNECT protocol is enabled. When disabled,
+    /// skip DATAGRAM flow creation for `:protocol` requests.
+    extended_connect_enabled: bool,
 }
 
 impl ServerHooks {
@@ -191,9 +194,19 @@ impl ServerHooks {
         let (mut stream_ctx, send, recv) =
             StreamCtx::new(stream_id, STREAM_CAPACITY);
 
-        if let Some(flow_id) = datagram::extract_flow_id(stream_id, &headers) {
-            let _ = driver.get_or_insert_flow(flow_id)?;
-            stream_ctx.associated_dgram_flow_id = Some(flow_id);
+        // When Extended CONNECT is enabled, extract the datagram flow ID
+        // from the request headers and register it in flow_map. This
+        // allows incoming DATAGRAMs to be routed to the correct stream.
+        // Note: flow_map entries are considered active work, so the
+        // connection will not be closed in cleanup_stream() while
+        // flows remain.
+        if driver.hooks.extended_connect_enabled() {
+            if let Some(flow_id) =
+                datagram::extract_quarter_stream_id(stream_id, &headers)
+            {
+                let _ = driver.get_or_insert_flow(flow_id)?;
+                stream_ctx.associated_dgram_flow_id = Some(flow_id);
+            }
         }
 
         let latest_priority_update: Option<RawPriorityValue> = driver
@@ -224,8 +237,15 @@ impl ServerHooks {
 
         driver
             .waiting_streams
-            .push(stream_ctx.wait_for_recv(stream_id));
+            .push(stream_ctx.wait_for_recv(stream_id))?;
         driver.insert_stream(stream_id, stream_ctx);
+
+        // A STOP_SENDING received before HEADERS had no stream context for
+        // the writable pass to update. Handle it now that the context exists,
+        // before the Headers event gives the application a response sender.
+        //
+        // This ensures the sender is already closed if the peer canceled.
+        driver.process_writable_stream(qconn, stream_id)?;
 
         driver
             .h3_event_sender
@@ -251,7 +271,12 @@ impl DriverHooks for ServerHooks {
             settings_enforcer: settings.into(),
             requests: 0,
             post_accept_timeout: None,
+            extended_connect_enabled: settings.enable_extended_connect,
         }
+    }
+
+    fn extended_connect_enabled(&self) -> bool {
+        self.extended_connect_enabled
     }
 
     fn conn_established(
@@ -301,6 +326,14 @@ impl DriverHooks for ServerHooks {
         }
 
         Self::handle_request(driver, qconn, headers)
+    }
+
+    fn stream_recv_closed(_driver: &mut H3Driver<Self>, _stream_id: u64) {}
+
+    fn stream_closed(driver: &mut H3Driver<Self>, stream_id: u64) {
+        let _ = driver
+            .h3_event_sender
+            .send(H3Event::StreamClosed { stream_id }.into());
     }
 
     fn conn_command(

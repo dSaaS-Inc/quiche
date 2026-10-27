@@ -82,6 +82,7 @@ impl PathState {
 
 /// A path-specific event.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum PathEvent {
     /// A new network path (local address, peer address) has been seen on a
     /// received packet. Note that this event is only triggered for servers, as
@@ -117,6 +118,34 @@ pub enum PathEvent {
     ///
     /// Note that this event is only raised if the path has been validated.
     PeerMigrated(SocketAddr, SocketAddr),
+
+    /// The validated PMTU available for normal application traffic changed on
+    /// the network path between `local` and `peer`.
+    ///
+    /// This event is generated only while PMTUD is enabled. It reports the
+    /// largest successfully probed size, falling back to QUIC's minimum packet
+    /// size while no larger size is validated. Unvalidated probe sizes and the
+    /// initial minimum set when the path is created are not reported.
+    PmtuUpdated {
+        /// The path's local address.
+        local: SocketAddr,
+
+        /// The path's peer address.
+        peer: SocketAddr,
+
+        /// The current validated PMTU limit for normal application traffic.
+        pmtu: usize,
+    },
+}
+
+pub(crate) fn pmtu_event(
+    local: SocketAddr, peer: SocketAddr, old: usize, new: usize,
+) -> Option<PathEvent> {
+    (old != new).then_some(PathEvent::PmtuUpdated {
+        local,
+        peer,
+        pmtu: new,
+    })
 }
 
 /// A network path on which QUIC packets can be sent.
@@ -184,6 +213,9 @@ pub struct Path {
 
     /// Number of DATAGRAM frames sent on this path.
     pub dgram_sent_count: usize,
+
+    /// Number of DATAGRAM frames marked lost on this path.
+    pub dgram_lost_count: usize,
 
     /// Number of DATAGRAM frames received on this path.
     pub dgram_recv_count: usize,
@@ -276,6 +308,7 @@ impl Path {
             retrans_count: 0,
             total_pto_count: 0,
             dgram_sent_count: 0,
+            dgram_lost_count: 0,
             dgram_recv_count: 0,
             sent_bytes: 0,
             recv_bytes: 0,
@@ -524,12 +557,10 @@ impl Path {
     /// packets, and it is still OK to fully reinitialize the recovery module to
     /// pickup changes to congestion control config.
     pub fn can_reinit_recovery(&self) -> bool {
-        // The recovery module can be reinitialized until the connection attempts
-        // to send a packet with inflight data. The congestion
-        // controller doesn't track anything interesting until inflight
-        // data is sent. Handshake ACKs may be sent prior to arrival of
-        // the full ClientHello, but the send of ACK only packets
-        // shouldn't prevent the reinit of the recovery module.
+        // Recovery can be reinitialized until the connection sends in-flight
+        // data. The congestion controller has no relevant state before then.
+        // ACK-only packets sent before the full ClientHello arrives should not
+        // prevent reinitialization.
         self.recovery.bytes_in_flight() == 0 &&
             self.recovery.bytes_in_flight_duration() == Duration::ZERO
     }
@@ -559,6 +590,7 @@ impl Path {
             total_pto_count: self.total_pto_count,
             dgram_recv: self.dgram_recv_count,
             dgram_sent: self.dgram_sent_count,
+            dgram_lost: self.dgram_lost_count,
             rtt: self.recovery.rtt(),
             min_rtt: self.recovery.min_rtt(),
             max_rtt: self.recovery.max_rtt(),
@@ -574,6 +606,7 @@ impl Path {
                 .recovery
                 .max_bandwidth()
                 .map(Bandwidth::to_bytes_per_second),
+            rtt_persistent_jump_count: self.recovery.rtt_persistent_jump_count(),
             startup_exit: self.recovery.startup_exit(),
         }
     }
@@ -634,7 +667,8 @@ impl PathMap {
     pub fn new(
         mut initial_path: Path, max_concurrent_paths: usize, is_server: bool,
     ) -> Self {
-        let mut paths = Slab::with_capacity(1); // most connections only have one path
+        // Most connections only have one path.
+        let mut paths = Slab::with_capacity(1);
         let mut addrs_to_paths = BTreeMap::new();
 
         let local_addr = initial_path.local_addr;
@@ -727,6 +761,15 @@ impl PathMap {
     #[inline]
     pub fn iter_mut(&mut self) -> slab::IterMut<'_, Path> {
         self.paths.iter_mut()
+    }
+
+    /// Returns a mutable iterator over all existing paths and the path event
+    /// queue.
+    #[inline]
+    pub(crate) fn iter_mut_and_events(
+        &mut self,
+    ) -> (slab::IterMut<'_, Path>, &mut VecDeque<PathEvent>) {
+        (self.paths.iter_mut(), &mut self.events)
     }
 
     /// Returns the number of existing paths.
@@ -906,6 +949,13 @@ impl PathMap {
         pmtud_max_probes: u8,
     ) {
         for (_, path) in self.paths.iter_mut() {
+            let old_pmtu = path
+                .pmtud
+                .as_ref()
+                .map_or(path.recovery.max_datagram_size(), |pmtud| {
+                    pmtud.get_current_mtu()
+                });
+
             path.pmtud = if discover {
                 Some(pmtud::Pmtud::new(
                     max_send_udp_payload_size,
@@ -914,6 +964,17 @@ impl PathMap {
             } else {
                 None
             };
+
+            if let Some(pmtud) = path.pmtud.as_ref() {
+                if let Some(event) = pmtu_event(
+                    path.local_addr,
+                    path.peer_addr,
+                    old_pmtu,
+                    pmtud.get_current_mtu(),
+                ) {
+                    self.events.push_back(event);
+                }
+            }
         }
     }
 }
@@ -925,6 +986,7 @@ impl PathMap {
 ///
 /// [`path_stats()`]: struct.Connection.html#method.path_stats
 #[derive(Clone)]
+#[non_exhaustive]
 pub struct PathStats {
     /// The local address of the path.
     pub local_addr: SocketAddr,
@@ -963,6 +1025,9 @@ pub struct PathStats {
 
     /// The number of DATAGRAM frames sent.
     pub dgram_sent: usize,
+
+    /// The number of DATAGRAM frames lost.
+    pub dgram_lost: usize,
 
     /// The estimated round-trip time of the connection.
     pub rtt: Duration,
@@ -1011,6 +1076,9 @@ pub struct PathStats {
     /// it is currently only implemented for bbr2_gcongestion.
     pub max_bandwidth: Option<u64>,
 
+    /// The total number of confirmed persistent RTT jump episodes.
+    pub rtt_persistent_jump_count: u64,
+
     /// Statistics from when a CCA first exited the startup phase.
     pub startup_exit: Option<StartupExit>,
 }
@@ -1042,8 +1110,11 @@ impl std::fmt::Debug for PathStats {
 
         write!(
             f,
-            " stream_retrans_bytes={} pmtu={} delivery_rate={}",
-            self.stream_retrans_bytes, self.pmtu, self.delivery_rate,
+            " stream_retrans_bytes={} pmtu={} delivery_rate={} rtt_persistent_jump_count={}",
+            self.stream_retrans_bytes,
+            self.pmtu,
+            self.delivery_rate,
+            self.rtt_persistent_jump_count,
         )
     }
 }
@@ -1051,12 +1122,83 @@ impl std::fmt::Debug for PathStats {
 #[cfg(test)]
 mod tests {
     use crate::rand;
+    use crate::test_utils;
     use crate::MIN_CLIENT_INITIAL_LEN;
 
     use crate::recovery::RecoveryConfig;
     use crate::Config;
 
     use super::*;
+
+    #[test]
+    fn pmtud_probe_respects_cwnd_during_pto() {
+        let local = "127.0.0.1:1234".parse().unwrap();
+        let peer = "127.0.0.1:4321".parse().unwrap();
+        let mut config = Config::new(crate::PROTOCOL_VERSION).unwrap();
+        config.discover_pmtu(true);
+        config.set_max_send_udp_payload_size(1400);
+        let recovery_config = RecoveryConfig::from_config(&config);
+        let mut path = Path::new(
+            local,
+            peer,
+            &recovery_config,
+            config.path_challenge_recv_max_queue_len,
+            true,
+            Some(&config),
+        );
+        let now = Instant::now();
+        let cwnd = path.recovery.cwnd();
+
+        path.recovery.on_packet_sent(
+            test_utils::helper_packet_sent(0, now, cwnd),
+            crate::packet::Epoch::Application,
+            HandshakeStatus {
+                has_handshake_keys: false,
+                peer_verified_address: true,
+                completed: true,
+            },
+            now,
+            "",
+        );
+        path.recovery
+            .inc_loss_probes(crate::packet::Epoch::Application);
+
+        assert!(path.pmtud.as_ref().unwrap().should_probe());
+        assert!(!path.should_send_pmtu_probe(true, true, 1400, false, true));
+    }
+
+    #[test]
+    fn reinitializing_pmtud_notifies_fallback_limit() {
+        let local = "127.0.0.1:1234".parse().unwrap();
+        let peer = "127.0.0.1:4321".parse().unwrap();
+        let mut config = Config::new(crate::PROTOCOL_VERSION).unwrap();
+        config.discover_pmtu(true);
+        config.set_max_send_udp_payload_size(1400);
+        let recovery_config = RecoveryConfig::from_config(&config);
+        let mut path = Path::new(
+            local,
+            peer,
+            &recovery_config,
+            config.path_challenge_recv_max_queue_len,
+            true,
+            Some(&config),
+        );
+        path.pmtud.as_mut().unwrap().successful_probe(1400);
+        let mut paths = PathMap::new(path, 1, false);
+
+        paths.set_discover_pmtu_on_existing_paths(false, 1400, 1);
+        assert_eq!(paths.pop_event(), None);
+
+        paths.set_discover_pmtu_on_existing_paths(true, 1400, 1);
+        assert_eq!(
+            paths.pop_event(),
+            Some(PathEvent::PmtuUpdated {
+                local,
+                peer,
+                pmtu: MIN_CLIENT_INITIAL_LEN,
+            })
+        );
+    }
 
     #[test]
     fn path_validation_limited_mtu() {
@@ -1094,8 +1236,7 @@ mod tests {
         assert!(path_mgr.get_mut(pid).unwrap().validation_requested());
         assert!(path_mgr.get_mut(pid).unwrap().probing_required());
 
-        // Fake sending of PathChallenge in a packet of MIN_CLIENT_INITIAL_LEN - 1
-        // bytes.
+        // Send `PathChallenge` one byte below `MIN_CLIENT_INITIAL_LEN`.
         let data = rand::rand_u64().to_be_bytes();
         path_mgr.get_mut(pid).unwrap().add_challenge_sent(
             data,

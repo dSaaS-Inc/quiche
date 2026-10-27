@@ -171,9 +171,8 @@ impl<'s> SocketCapabilitiesBuilder<'s> {
     /// individual packets happens in the NIC, if it supports GSO. The
     /// parameter specifies the packet size.
     pub fn gso(&mut self) -> io::Result<()> {
-        // We initialize GSO on the socket with the maximum possible segment size
-        // to prevent accidentally setting it too small and running into
-        // issues when increasing max_send_udp_payload_size later on.
+        // Initialize GSO with the maximum segment size so later increases to
+        // `max_send_udp_payload_size` do not exceed the initial setting.
         //
         // https://elixir.bootlin.com/linux/v6.14.6/source/net/ipv4/udp.c#L2998
         // https://elixir.bootlin.com/linux/v6.14.6/source/include/vdso/limits.h#L5
@@ -326,6 +325,9 @@ impl<'s> SocketCapabilitiesBuilder<'s> {
 /// As a shortcut, you may call `apply_all_and_get_compatibility` to apply the
 /// maxmimum set of capabilities supported by this crate. The result will
 /// indicate which options were actually enabled.
+/// Set `TOKIO_QUICHE_DISABLE_GSO` to `1`, `true`, `TRUE`, or `True`
+/// (ignoring surrounding whitespace) to disable automatic GSO configuration
+/// and its use by connections, including with explicitly supplied capabilities.
 #[derive(Debug, Default)]
 pub struct SocketCapabilities {
     /// Indicates if the socket has `UDP_SEGMENT` enabled.
@@ -381,6 +383,15 @@ pub struct SocketCapabilities {
 }
 
 impl SocketCapabilities {
+    pub(crate) fn gso_disabled_by_env() -> bool {
+        matches!(
+            std::env::var("TOKIO_QUICHE_DISABLE_GSO")
+                .as_deref()
+                .map(str::trim),
+            Ok("1") | Ok("true") | Ok("TRUE") | Ok("True")
+        )
+    }
+
     /// Tries to enable all supported sockopts and returns indicators
     /// of which settings were successfully applied.
     #[cfg(target_os = "linux")]
@@ -389,13 +400,7 @@ impl SocketCapabilities {
         S: AsFd,
     {
         let mut b = SocketCapabilitiesBuilder::new(socket);
-        let disable_gso = matches!(
-            std::env::var("TOKIO_QUICHE_DISABLE_GSO")
-                .as_deref()
-                .map(str::trim),
-            Ok("1") | Ok("true") | Ok("TRUE") | Ok("True")
-        );
-        if !disable_gso {
+        if !Self::gso_disabled_by_env() {
             let _ = b.gso();
         }
         let _ = b.check_udp_drop();

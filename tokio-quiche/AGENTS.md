@@ -9,7 +9,7 @@ Async tokio wrapper for `quiche`. Spawns per-connection IO worker tasks driven b
 ```
 src/
   lib.rs              Re-exports, listen(), capture_quiche_logs()
-  buf_factory.rs      BufFactory: tiered static pools, QuicheBuf (zero-copy feature)
+  buf_factory.rs      BufFactory: wraps quiche::BufFactory; provides MAX_BUF_SIZE constant
   result.rs           BoxError = Box<dyn Error+Send+Sync>, QuicResult<T>
   settings/           ConnectionParams → quiche::Config → h3::Config cascade
   metrics/            Metrics trait (pluggable); DefaultMetrics (foundations Prometheus)
@@ -29,14 +29,13 @@ src/
 | Per-connection IO loop | `quic/io/worker.rs` — `IoWorker` |
 | Packet routing/demux | `quic/router/mod.rs` — `InboundPacketRouter` |
 | Config cascade | `settings/config.rs` — `Config::new()` |
-| Buffer pools | `buf_factory.rs` — `BufFactory`, static pools |
 | Metrics interface | `metrics/mod.rs` — `Metrics` trait |
 
 ## CODE MAP
 
 | Symbol | Type | Location | Role |
 |--------|------|----------|------|
-| `ApplicationOverQuic` | trait | `quic/connection/mod.rs` | Extension point: on_conn_established, process_reads/writes, wait_for_data |
+| `ApplicationOverQuic` | trait | `quic/connection/mod.rs` | Extension point: connection lifecycle, reads/writes, wait_for_data |
 | `H3Driver<H>` | struct | `http3/driver/mod.rs` | Implements `ApplicationOverQuic` for HTTP/3 |
 | `DriverHooks` | sealed trait | `http3/driver/hooks.rs` | Client vs server H3 behavior |
 | `IoWorker<Tx,M,S>` | struct | `quic/io/worker.rs` | Per-connection state machine (recv -> app -> send) |
@@ -46,20 +45,20 @@ src/
 | `QuicConnection` | struct | `quic/connection/mod.rs` | Post-handshake metadata handle (not the qconn itself) |
 | `ConnectionParams` | struct | `settings/mod.rs` | QuicSettings + TLS + Hooks + session |
 | `Config` | struct(crate) | `settings/config.rs` | Builds quiche::Config from ConnectionParams |
-| `BufFactory` | struct | `buf_factory.rs` | Handle to static tiered buffer pools |
-| `QuicheBuf` | struct | `buf_factory.rs` | Zero-copy splittable buffer (zero-copy feature) |
+| `BufFactory` | struct | `buf_factory.rs` | Wraps `quiche::BufFactory`; `Buf = Bytes` |
 | `Metrics` | trait | `metrics/mod.rs` | Pluggable telemetry; `DefaultMetrics` uses foundations |
 | `QuicCommand` | enum | `quic/connection/mod.rs` | ConnectionClose / Custom / Stats commands |
 | `BoxError` | type alias | `result.rs` | `Box<dyn Error + Send + Sync>` — deliberate choice, see docstring |
 
 ## CONVENTIONS (crate-specific)
 
-- Re-exports: `pub extern crate quiche`, `pub use buffer_pool`, `pub use datagram_socket`.
+- Re-exports: `pub extern crate quiche`, `pub use datagram_socket`.
 - `foundations` for logging (slog), not `log` directly. `capture_quiche_logs()` bridges quiche's `log` into slog.
 - `DriverHooks` is **sealed** — prevents external `H3Driver` variants.
 - `QuicAuditStats` (from `datagram-socket`) threaded through all connections via `Arc`.
 - Task spawning via `metrics::tokio_task::spawn()` / `spawn_with_killswitch()` — wraps `tokio::spawn` with optional schedule/poll histograms.
 - `ConnectionStage` FSM: `Handshake` -> `RunningApplication` -> `Close`.
+- `IoWorker` drains `PathEvent`s and forwards them directly through `ConnectionHook::on_path_event` when a hook is configured, avoiding protocol-specific H3 plumbing.
 
 ## ANTI-PATTERNS
 

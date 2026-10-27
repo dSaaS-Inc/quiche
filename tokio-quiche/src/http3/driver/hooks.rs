@@ -75,6 +75,15 @@ pub trait DriverHooks: Sized + Send + 'static {
         headers: InboundHeaders,
     ) -> H3ConnectionResult<()>;
 
+    /// Performs endpoint-specific cleanup when the receive direction is
+    /// terminated by a peer FIN or reset. The stream can remain in the driver's
+    /// stream map until its write direction is also finished.
+    fn stream_recv_closed(driver: &mut H3Driver<Self>, stream_id: u64);
+
+    /// Performs endpoint-specific cleanup after a stream is removed from the
+    /// driver's stream map.
+    fn stream_closed(driver: &mut H3Driver<Self>, stream_id: u64);
+
     /// Processes any command received from the
     /// [`H3Controller`](super::H3Controller). May use
     /// `H3Driver::handle_core_command` to handle regular [`H3Command`]s.
@@ -82,6 +91,12 @@ pub trait DriverHooks: Sized + Send + 'static {
         driver: &mut H3Driver<Self>, qconn: &mut QuicheConnection,
         cmd: Self::Command,
     ) -> H3ConnectionResult<()>;
+
+    /// Whether the extended CONNECT protocol is enabled. Used to gate
+    /// datagram flow creation.
+    fn extended_connect_enabled(&self) -> bool {
+        false
+    }
 
     /// Determines whether the hook's `wait_for_action` future will be polled
     /// as part of `ApplicationOverQuic::wait_for_data`. Defaults to `false` and

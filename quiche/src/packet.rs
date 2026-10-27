@@ -927,7 +927,7 @@ impl CryptoContext {
             u64::MAX,
             u64::MAX,
             true,
-            true,
+            stream::MAX_STREAM_WINDOW,
             stream::MAX_STREAM_WINDOW,
         );
         CryptoContext {
@@ -947,7 +947,7 @@ impl CryptoContext {
             u64::MAX,
             u64::MAX,
             true,
-            true,
+            stream::MAX_STREAM_WINDOW,
             stream::MAX_STREAM_WINDOW,
         );
     }
@@ -1058,9 +1058,9 @@ impl PktNumManager {
     }
 
     pub fn should_skip_pn(&self, handshake_completed: bool) -> bool {
-        // Only skip a new packet once we have validated  the peer hasn't sent the
-        // current skip packet.  For the purposes of OACK, a skip_pn is
-        // considered validated once we receive an ACK for pn > skip_pn.
+        // Only skip after confirming the peer did not send the current skip
+        // packet. For OACK, an ACK for a higher packet number validates
+        // `skip_pn`.
         let no_current_skip_packet = self.skip_pn.is_none();
         let counter_expired = match self.skip_pn_counter {
             // Skip if counter has expired

@@ -42,7 +42,6 @@ use datagram_socket::QuicAuditStats;
 use datagram_socket::ShutdownConnection;
 use datagram_socket::SocketStats;
 use foundations::telemetry::log;
-use futures::future::BoxFuture;
 use futures::Future;
 use quiche::ConnectionId;
 use std::fmt;
@@ -58,6 +57,7 @@ use tokio::sync::mpsc;
 use tokio_util::task::AbortOnDropHandle;
 
 use self::error::make_handshake_result;
+use super::hooks::ConnectionHook;
 use super::io::connection_stage::Close;
 use super::io::connection_stage::ConnectionStageContext;
 use super::io::connection_stage::Handshake;
@@ -67,8 +67,8 @@ use super::io::worker::IoWorkerParams;
 use super::io::worker::Running;
 use super::io::worker::RunningOrClosing;
 use super::io::worker::WriteState;
+use super::DscpHandle;
 use super::QuicheConnection;
-use crate::buf_factory::PooledBuf;
 use crate::metrics::Metrics;
 use crate::quic::io::worker::IoWorker;
 use crate::quic::io::worker::WriterConfig;
@@ -90,7 +90,7 @@ impl QuicConnectionStats {
     pub(crate) fn from_conn(qconn: &QuicheConnection) -> Self {
         Self {
             stats: qconn.stats(),
-            path_stats: qconn.path_stats().next(),
+            path_stats: qconn.path_stats().find(|stats| stats.active),
         }
     }
 
@@ -196,7 +196,7 @@ pub struct Incoming {
     /// Used for the `perf-quic-listener-metrics` feature.
     pub rx_time: Option<SystemTime>,
     /// The packet's contents.
-    pub buf: PooledBuf,
+    pub buf: Vec<u8>,
     /// If set, then `buf` is a GRO buffer containing multiple packets.
     /// Each individual packet has a size of `gso` (except for the last one).
     pub gro: Option<i32>,
@@ -278,7 +278,17 @@ where
     /// [boring]'s SSL object for this connection.
     #[doc(hidden)]
     pub fn ssl_mut(&mut self) -> &mut SslRef {
-        self.params.quiche_conn.as_mut()
+        // Deref to pick `Connection::as_mut` over `Box::as_mut`.
+        (*self.params.quiche_conn).as_mut()
+    }
+
+    /// Returns the outgoing DSCP handle when server marking is configured.
+    ///
+    /// Clone it before starting the handshake to update the worker's marking
+    /// from a certificate-selection callback. Until then the handle has no
+    /// per-packet override, so packets inherit the UDP socket's TOS/TClass.
+    pub fn dscp_handle(&self) -> Option<&DscpHandle> {
+        self.params.dscp_handle.as_ref()
     }
 
     /// A handle to the [`QuicAuditStats`] for this connection.
@@ -308,12 +318,11 @@ where
     /// This is a lower-level alternative to the `handshake` function which
     /// gives the caller more control over execution of the future. See
     /// `handshake` for details on the return values.
-    #[allow(clippy::type_complexity)]
     pub fn handshake_fut<A: ApplicationOverQuic>(
         self, app: A,
     ) -> (
         QuicConnection,
-        BoxFuture<'static, io::Result<Running<Arc<Tx>, M, A>>>,
+        impl Future<Output = io::Result<Running<Arc<Tx>, M, A>>> + Send + 'static,
     ) {
         self.params.metrics.connections_in_memory().inc();
 
@@ -329,21 +338,22 @@ where
             incoming_pkt_receiver: self.incoming_ev_receiver,
             application: app,
             stats: Arc::clone(&self.stats),
+            connection_hook: self.params.connection_hook,
         };
-        let conn_stage = Handshake {
-            handshake_info: self.params.handshake_info,
-        };
+        let conn_stage = Handshake;
         let params = IoWorkerParams {
             socket: MaybeConnectedSocket::new(self.params.socket),
             shutdown_tx: self.params.shutdown_tx,
             cfg: self.params.writer_cfg,
             audit_log_stats: self.audit_log_stats,
             write_state: WriteState::default(),
+            dscp_handle: self.params.dscp_handle,
             conn_map_cmd_tx: self.params.conn_map_cmd_tx,
             cid_generator: self.params.cid_generator,
             #[cfg(feature = "perf-quic-listener-metrics")]
             init_rx_time: self.params.init_rx_time,
             metrics: self.params.metrics.clone(),
+            handshake_info: self.params.handshake_info,
         };
 
         let handshake_fut = async move {
@@ -368,7 +378,7 @@ where
             }
         };
 
-        (conn, Box::pin(handshake_fut))
+        (conn, handshake_fut)
     }
 
     /// Performs the QUIC handshake in a separate tokio task and awaits its
@@ -392,8 +402,8 @@ where
             handshake_fut,
         );
 
-        // `AbortOnDropHandle` simulates task-killswitch behavior without needing
-        // to give up ownership of the `JoinHandle`.
+        // `AbortOnDropHandle` simulates task-killswitch behavior without
+        // needing to give up ownership of the `JoinHandle`.
         let handshake_abort_handle = AbortOnDropHandle::new(handshake_handle);
 
         let worker = handshake_abort_handle.await??;
@@ -439,12 +449,15 @@ where
     pub fn start<A: ApplicationOverQuic>(self, app: A) -> QuicConnection {
         let task_metrics = self.params.metrics.clone();
         let (conn, handshake_fut) = Self::handshake_fut(self, app);
+        // Pin to the heap so the spawned task only carries a pointer to it
+        // instead of inlining the full future state across the await.
+        let handshake_fut = Box::pin(handshake_fut);
 
         let fut = async move {
             match handshake_fut.await {
                 Ok(running) => Self::resume(running),
                 Err(e) => {
-                    log::error!("QUIC handshake failed in IQC::start"; "error" => e)
+                    log::error!("QUIC handshake failed in IQC::start"; "error" => e);
                 },
             }
         };
@@ -466,15 +479,21 @@ where
 {
     pub writer_cfg: WriterConfig,
     pub initial_pkt: Option<Incoming>,
+    pub dscp_handle: Option<DscpHandle>,
     pub shutdown_tx: mpsc::Sender<()>,
     pub conn_map_cmd_tx: mpsc::UnboundedSender<ConnectionMapCommand>, /* channel that signals connection map changes */
     pub scid: ConnectionId<'static>,
     pub cid_generator: Option<SharedConnectionIdGenerator>,
     pub metrics: M,
+    pub connection_hook: Option<Arc<dyn ConnectionHook + Send + Sync + 'static>>,
     #[cfg(feature = "perf-quic-listener-metrics")]
     pub init_rx_time: Option<SystemTime>,
     pub handshake_info: HandshakeInfo,
-    pub quiche_conn: QuicheConnection,
+    /// Boxed because this value is moved by-value through several nested
+    /// async state machines. Inlining a [`QuicheConnection`] here would
+    /// duplicate its payload across the future state slots that hold it
+    /// across an `.await`.
+    pub quiche_conn: Box<QuicheConnection>,
     pub socket: Arc<Tx>,
     pub local_addr: SocketAddr,
     pub peer_addr: SocketAddr,
@@ -675,19 +694,8 @@ pub trait ApplicationOverQuic: Send + 'static {
     /// worker.
     ///
     /// The function is checked in each iteration of the worker loop. Only
-    /// `on_conn_established()` and `buffer()` bypass this check.
+    /// `on_conn_established()` bypasses this check.
     fn should_act(&self) -> bool;
-
-    /// A borrowed buffer for the worker to write outbound packets into.
-    ///
-    /// This method allows sharing a buffer between the worker and the
-    /// application, efficiently using the allocated memory while the
-    /// application is inactive. It can also be used to artificially
-    /// restrict the size of outbound network packets.
-    ///
-    /// Any data in the buffer may be overwritten by the worker. If necessary,
-    /// the application should save the contents when this method is called.
-    fn buffer(&mut self) -> &mut [u8];
 
     /// Waits for an event to trigger the next iteration of the worker loop.
     ///

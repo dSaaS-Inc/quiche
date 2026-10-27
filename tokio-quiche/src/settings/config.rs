@@ -27,8 +27,12 @@
 use foundations::telemetry::log;
 use std::borrow::Cow;
 use std::fs::File;
+use std::sync::Arc;
 use std::time::Duration;
 
+use qlog::writer::QlogCompression;
+
+use crate::quic::ConnectionHook;
 use crate::result::QuicResult;
 use crate::settings::CertificateKind;
 use crate::settings::ConnectionParams;
@@ -45,6 +49,7 @@ pub(crate) struct Config {
     pub quiche_config: quiche::Config,
     pub disable_client_ip_validation: bool,
     pub qlog_dir: Option<String>,
+    pub qlog_compression: QlogCompression,
     pub has_gso: bool,
     pub pacing_offload: bool,
     pub enable_expensive_packet_count_metrics: bool,
@@ -53,6 +58,8 @@ pub(crate) struct Config {
     pub handshake_timeout: Option<Duration>,
     pub has_ippktinfo: bool,
     pub has_ipv6pktinfo: bool,
+    pub pool_send_buffer: bool,
+    pub connection_hook: Option<Arc<dyn ConnectionHook + Send + Sync + 'static>>,
 }
 
 impl AsMut<quiche::Config> for Config {
@@ -72,7 +79,9 @@ impl Config {
         };
         let keylog_file = keylog_path.and_then(|path| if KEYLOGFILE_ENABLED {
                 File::options().create(true).append(true).open(path)
-                    .inspect_err(|e| log::warn!("failed to open SSLKEYLOGFILE"; "error" => e))
+                    .inspect_err(|e| {
+                        log::warn!("failed to open SSLKEYLOGFILE"; "error" => e);
+                    })
                     .ok()
             } else {
                 log::warn!("SSLKEYLOGFILE is set, but `--cfg capture_keylogs` was not enabled. No keys will be logged.");
@@ -87,13 +96,7 @@ impl Config {
             ..
         } = socket_capabilities;
 
-        let has_gso = has_gso
-            && !matches!(
-                std::env::var("TOKIO_QUICHE_DISABLE_GSO")
-                    .as_deref()
-                    .map(str::trim),
-                Ok("1") | Ok("true") | Ok("TRUE") | Ok("True")
-            );
+        let has_gso = has_gso && !SocketCapabilities::gso_disabled_by_env();
 
         #[cfg(feature = "gcongestion")]
         let pacing_offload = quic_settings.enable_pacing && pacing_offload;
@@ -103,6 +106,7 @@ impl Config {
             disable_client_ip_validation: quic_settings
                 .disable_client_ip_validation,
             qlog_dir: quic_settings.qlog_dir.clone(),
+            qlog_compression: quic_settings.qlog_compression,
             has_gso,
             pacing_offload,
             enable_expensive_packet_count_metrics: quic_settings
@@ -112,6 +116,8 @@ impl Config {
             handshake_timeout: quic_settings.handshake_timeout,
             has_ippktinfo,
             has_ipv6pktinfo,
+            pool_send_buffer: quic_settings.pool_send_buffer,
+            connection_hook: params.hooks.connection_hook.clone(),
         })
     }
 }
@@ -239,11 +245,14 @@ fn quiche_config_with_tls(
     match tls.kind {
         #[cfg(not(feature = "rpk"))]
         CertificateKind::RawPublicKey => {
-            // TODO: don't compile this enum variant unless rpk feature is enabled
+            // TODO: Gate this variant on the `rpk` feature.
             panic!("Can't use RPK when compiled without rpk feature");
         },
-        #[cfg(feature = "rpk")]
+        #[cfg(all(feature = "rpk", not(boring_v5)))]
         CertificateKind::RawPublicKey => {
+            // boring 4.x (the default) exposes a dedicated
+            // `SslContextBuilder::new_rpk()` constructor plus
+            // `set_rpk_certificate` / `set_null_chain_private_key`.
             let mut ssl_ctx_builder = boring::ssl::SslContextBuilder::new_rpk()?;
             let raw_public_key = read_file(tls.cert)?;
             ssl_ctx_builder.set_rpk_certificate(&raw_public_key)?;
@@ -252,6 +261,33 @@ fn quiche_config_with_tls(
             let pkey =
                 boring::pkey::PKey::private_key_from_pem(&raw_private_key)?;
             ssl_ctx_builder.set_null_chain_private_key(&pkey)?;
+
+            Ok(quiche::Config::with_boring_ssl_ctx_builder(
+                quiche::PROTOCOL_VERSION,
+                ssl_ctx_builder,
+            )?)
+        },
+        #[cfg(all(feature = "rpk", boring_v5))]
+        CertificateKind::RawPublicKey => {
+            // boring 5.x replaced the dedicated `SslContextBuilder::new_rpk()`
+            // entry point with a credential-based API: build an
+            // `SslCredential` configured for raw public keys and add it
+            // to a regular `SslContextBuilder` via `add_credential`.
+            let raw_public_key = read_file(tls.cert)?;
+            let raw_private_key = read_file(tls.private_key)?;
+            let pkey =
+                boring::pkey::PKey::private_key_from_pem(&raw_private_key)?;
+
+            let mut credential_builder =
+                boring::ssl::SslCredential::new_raw_public_key()?;
+            credential_builder.set_spki_bytes(Some(&raw_public_key))?;
+            credential_builder.set_private_key(&pkey)?;
+            let credential = credential_builder.build();
+
+            let mut ssl_ctx_builder = boring::ssl::SslContextBuilder::new(
+                boring::ssl::SslMethod::tls(),
+            )?;
+            ssl_ctx_builder.add_credential(&credential)?;
 
             Ok(quiche::Config::with_boring_ssl_ctx_builder(
                 quiche::PROTOCOL_VERSION,
@@ -274,4 +310,51 @@ fn read_file(path: &str) -> QuicResult<Vec<u8>> {
     std::fs::read(path)
         .with_context(|| format!("read {path}"))
         .map_err(Into::into)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn verify_locations_file_loading() {
+        let mut params = ConnectionParams::default();
+        assert!(params.settings.verify_locations_file.is_none());
+        params.settings.verify_peer = true;
+        params.settings.verify_locations_file = Some(
+            concat!(env!("CARGO_MANIFEST_DIR"), "/../quiche/examples/rootca.crt")
+                .into(),
+        );
+        assert!(make_quiche_config(&params, false).is_ok());
+
+        let dir = tempfile::tempdir().unwrap();
+        params.settings.verify_locations_file =
+            Some(dir.path().join("missing.pem").to_str().unwrap().into());
+        assert!(make_quiche_config(&params, false).is_err());
+
+        params.settings.verify_peer = false;
+        assert!(make_quiche_config(&params, false).is_ok());
+    }
+
+    #[test]
+    fn gso_env_override() {
+        let config =
+            Config::new(&ConnectionParams::default(), SocketCapabilities {
+                has_gso: true,
+                ..Default::default()
+            })
+            .unwrap();
+        let value = std::env::var("TOKIO_QUICHE_DISABLE_GSO").ok();
+        let disabled = value.as_deref().is_some_and(|value| {
+            ["1", "true", "TRUE", "True"].contains(&value.trim())
+        });
+        assert_eq!(config.has_gso, !disabled);
+
+        let config = Config::new(
+            &ConnectionParams::default(),
+            SocketCapabilities::default(),
+        )
+        .unwrap();
+        assert!(!config.has_gso);
+    }
 }
